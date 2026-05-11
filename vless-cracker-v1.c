@@ -172,6 +172,7 @@ typedef struct {
 typedef enum {
     PROBE_ROUND_VALID,
     PROBE_ROUND_CONNECTION_ERROR,
+    PROBE_ROUND_NO_SIGNAL,
     PROBE_ROUND_INTERNAL_ERROR
 } ReplayRoundStatus;
 
@@ -1139,6 +1140,16 @@ static char probe_comparison_code(const ReplayProbeResult *a,
     return probe_rounds_match(a, c, count) ? 'E' : 'D';
 }
 
+static int probe_round_has_signal(const ReplayProbeResult *results,
+                                  size_t count) {
+    for (size_t i = 0; i < count; i++) {
+        if (replay_result_probe_status(&results[i]) != PROBE_STATUS_NONE) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static void build_replay_probe_summary(const ReplayProbeResult *results,
                                        size_t count,
                                        const char *label,
@@ -1813,6 +1824,8 @@ static ReplayRoundStatus run_replay_probe_round(ReplayTask *task,
     int *created = calloc(probe_count, sizeof(*created));
     int round_valid = 1;
     int internal_error = 0;
+    int connection_error = 0;
+    int no_signal = 0;
 
     if (!threads || !probe_tasks || !created) {
         log_infof("TLS replay attempt=%d discarded; failed to allocate concurrent probe tasks\n",
@@ -1857,9 +1870,17 @@ static ReplayRoundStatus run_replay_probe_round(ReplayTask *task,
                           attempt, i + 1,
                           replay_status_name(results[i].final_status));
                 round_valid = 0;
+                connection_error = 1;
                 break;
             }
         }
+    }
+
+    if (round_valid && !probe_round_has_signal(results, probe_count)) {
+        log_infof("TLS replay attempt=%d discarded; all probes returned NONE\n",
+                  attempt);
+        round_valid = 0;
+        no_signal = 1;
     }
 
     free(threads);
@@ -1868,8 +1889,17 @@ static ReplayRoundStatus run_replay_probe_round(ReplayTask *task,
     if (internal_error) {
         return PROBE_ROUND_INTERNAL_ERROR;
     }
-    return round_valid ? PROBE_ROUND_VALID :
-                         PROBE_ROUND_CONNECTION_ERROR;
+    if (round_valid) {
+        return PROBE_ROUND_VALID;
+    }
+
+    if (connection_error) {
+        return PROBE_ROUND_CONNECTION_ERROR;
+    }
+    if (no_signal) {
+        return PROBE_ROUND_NO_SIGNAL;
+    }
+    return PROBE_ROUND_CONNECTION_ERROR;
 }
 
 static void *replay_probe_worker(void *arg) {
@@ -1929,8 +1959,10 @@ static void *replay_probe_worker(void *arg) {
                                   &matched_rounds, &final_match);
         log_infof("TLS replay confirmation round=%u skipped; discarded round A=%s B=%s\n",
                   task->round_no,
-                  a_status == PROBE_ROUND_VALID ? "valid" : "discarded",
-                  b_status == PROBE_ROUND_VALID ? "valid" : "discarded");
+                  a_status == PROBE_ROUND_VALID ? "valid" :
+                  (a_status == PROBE_ROUND_NO_SIGNAL ? "no_signal" : "discarded"),
+                  b_status == PROBE_ROUND_VALID ? "valid" :
+                  (b_status == PROBE_ROUND_NO_SIGNAL ? "no_signal" : "discarded"));
     } else {
         int round_matches = replay_probe_matches_alarm_condition(a, c,
                                                                  probe_count);
