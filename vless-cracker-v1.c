@@ -1090,6 +1090,30 @@ static void build_comparison_summary(const ReplayProbeResult *a,
     appendf(dst, dst_len, "cmp=X[%c]", ac);
 }
 
+static int report_filter_matches_a_fingerprint(const ReplayProbeResult *a,
+                                               size_t count) {
+    static const ProbeStatus expected[] = {
+        PROBE_STATUS_TIMEOUT,
+        PROBE_STATUS_ALERT,
+        PROBE_STATUS_ALERT,
+        PROBE_STATUS_ALERT,
+        PROBE_STATUS_ALERT,
+        PROBE_STATUS_ALERT,
+        PROBE_STATUS_ALERT
+    };
+
+    if (count != sizeof(expected) / sizeof(expected[0])) {
+        return 0;
+    }
+
+    for (size_t i = 0; i < count; i++) {
+        if (replay_result_probe_status(&a[i]) != expected[i]) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static void print_replay_comparison(const FlowKey *client_key,
                                     const FlowKey *server_key,
                                     const char *sni,
@@ -1129,6 +1153,10 @@ static void print_replay_comparison(const FlowKey *client_key,
 
     if (!mismatch) {
         log_infof("[%s.%06ld] TLS ReplayProbe MATCH server=%s:%u sni=%s probes=%zu %s result=%s\n",
+                  timebuf, (long)ts.tv_usec, server_addr, server_key->sport,
+                  sni_value, probe_count, comparison_summary, result_summary);
+    } else if (!report_filter_matches_a_fingerprint(a, probe_count)) {
+        log_infof("[%s.%06ld] TLS ReplayProbe MISMATCH suppressed server=%s:%u sni=%s probes=%zu %s result=%s\n",
                   timebuf, (long)ts.tv_usec, server_addr, server_key->sport,
                   sni_value, probe_count, comparison_summary, result_summary);
     } else {
