@@ -40,6 +40,7 @@
 #define TLS13_ENCRYPTED_ALERT_RECORD_LEN 19
 #define DEFAULT_PROBE_FILE "characteristic.txt"
 #define MAX_TLS_SNI 256
+#define REQUIRED_CONFIRMATION_ROUNDS 3
 
 typedef struct {
     int ip_version;
@@ -89,6 +90,9 @@ typedef struct {
     int ip_version;
     uint8_t addr[16];
     uint16_t port;
+    int in_progress;
+    int excluded;
+    unsigned int matched_rounds;
 } ProbedServer;
 
 typedef struct {
@@ -117,6 +121,7 @@ typedef struct {
     size_t client_hello_len;
     uint8_t *client_hello;
     char sni[MAX_TLS_SNI];
+    unsigned int round_no;
 } ReplayTask;
 
 typedef enum {
@@ -151,7 +156,24 @@ typedef struct {
 typedef struct {
     AppDataCloseProbe appdata_close;
     int got_response;
+    int connection_failed;
+    ReplayStatus final_status;
 } ReplayProbeResult;
+
+typedef struct {
+    ReplayTask *task;
+    const uint8_t *client_hello;
+    size_t client_hello_len;
+    int attempt;
+    size_t probe_index;
+    ReplayProbeResult *result;
+} ReplayProbeAttemptTask;
+
+typedef enum {
+    PROBE_ROUND_VALID,
+    PROBE_ROUND_CONNECTION_ERROR,
+    PROBE_ROUND_INTERNAL_ERROR
+} ReplayRoundStatus;
 
 static const char *replay_status_name(ReplayStatus status);
 
@@ -543,30 +565,80 @@ static int server_address_equal(const ProbedServer *server, const FlowKey *serve
            memcmp(server->addr, server_key->src, addr_len) == 0;
 }
 
-static int mark_server_probed_if_new(App *app, const FlowKey *server_key) {
+static int start_server_probe_round(App *app, const FlowKey *server_key,
+                                    unsigned int *round_no) {
     int slot = -1;
 
     pthread_mutex_lock(&app->lock);
     for (int i = 0; i < MAX_PROBED_SERVERS; i++) {
         if (server_address_equal(&app->probed_servers[i], server_key)) {
+            ProbedServer *server = &app->probed_servers[i];
+            if (server->excluded || server->in_progress ||
+                server->matched_rounds >= REQUIRED_CONFIRMATION_ROUNDS) {
+                pthread_mutex_unlock(&app->lock);
+                return 0;
+            }
+            server->in_progress = 1;
+            *round_no = server->matched_rounds + 1;
             pthread_mutex_unlock(&app->lock);
-            return 0;
+            return 1;
         }
         if (slot < 0 && !app->probed_servers[i].used) {
             slot = i;
         }
     }
     if (slot < 0) {
-        slot = 0;
+        pthread_mutex_unlock(&app->lock);
+        return 0;
     }
 
     app->probed_servers[slot].used = 1;
     app->probed_servers[slot].ip_version = server_key->ip_version;
     app->probed_servers[slot].port = server_key->sport;
+    app->probed_servers[slot].in_progress = 1;
+    app->probed_servers[slot].excluded = 0;
+    app->probed_servers[slot].matched_rounds = 0;
     memcpy(app->probed_servers[slot].addr, server_key->src,
            server_key->ip_version == 4 ? 4 : 16);
+    *round_no = 1;
     pthread_mutex_unlock(&app->lock);
     return 1;
+}
+
+static void finish_server_probe_round(App *app, const FlowKey *server_key,
+                                      int matched, int retry_later,
+                                      unsigned int *matched_rounds_out,
+                                      int *final_match_out) {
+    *matched_rounds_out = 0;
+    *final_match_out = 0;
+
+    pthread_mutex_lock(&app->lock);
+    for (int i = 0; i < MAX_PROBED_SERVERS; i++) {
+        ProbedServer *server = &app->probed_servers[i];
+        if (!server_address_equal(server, server_key)) {
+            continue;
+        }
+
+        server->in_progress = 0;
+        if (retry_later) {
+            *matched_rounds_out = server->matched_rounds;
+            break;
+        }
+
+        if (matched) {
+            server->matched_rounds++;
+            *matched_rounds_out = server->matched_rounds;
+            if (server->matched_rounds >= REQUIRED_CONFIRMATION_ROUNDS) {
+                *final_match_out = 1;
+                server->excluded = 1;
+            }
+        } else {
+            server->excluded = 1;
+            *matched_rounds_out = server->matched_rounds;
+        }
+        break;
+    }
+    pthread_mutex_unlock(&app->lock);
 }
 
 static int seq_before(uint32_t a, uint32_t b) {
@@ -1114,6 +1186,13 @@ static int report_filter_matches_a_fingerprint(const ReplayProbeResult *a,
     return 1;
 }
 
+static int replay_probe_matches_alarm_condition(const ReplayProbeResult *a,
+                                                const ReplayProbeResult *c,
+                                                size_t probe_count) {
+    return !probe_rounds_match(a, c, probe_count) &&
+           report_filter_matches_a_fingerprint(a, probe_count);
+}
+
 static void print_replay_comparison(const FlowKey *client_key,
                                     const FlowKey *server_key,
                                     const char *sni,
@@ -1150,18 +1229,22 @@ static void print_replay_comparison(const FlowKey *client_key,
                              sizeof(comparison_summary));
 
     int mismatch = !probe_rounds_match(a, c, probe_count);
+    int alarm_condition = replay_probe_matches_alarm_condition(a, c,
+                                                               probe_count);
 
     if (!mismatch) {
         log_infof("[%s.%06ld] TLS ReplayProbe MATCH server=%s:%u sni=%s probes=%zu %s result=%s\n",
                   timebuf, (long)ts.tv_usec, server_addr, server_key->sport,
                   sni_value, probe_count, comparison_summary, result_summary);
-    } else if (!report_filter_matches_a_fingerprint(a, probe_count)) {
+    } else if (!alarm_condition) {
         log_infof("[%s.%06ld] TLS ReplayProbe MISMATCH suppressed server=%s:%u sni=%s probes=%zu %s result=%s\n",
                   timebuf, (long)ts.tv_usec, server_addr, server_key->sport,
                   sni_value, probe_count, comparison_summary, result_summary);
     } else {
-        printf("\033[31m[%s.%06ld] TLS ReplayProbe MISMATCH, VLESS/REALITY connection detected. client=%s:%u server=%s:%u sni=%s probes=%zu %s result=%s",
+        printf("\033[31m[%s.%06ld] TLS ReplayProbe MISMATCH, VLESS/REALITY connection detected after %u/%u confirmations. client=%s:%u server=%s:%u sni=%s probes=%zu %s result=%s",
                timebuf, (long)ts.tv_usec,
+               REQUIRED_CONFIRMATION_ROUNDS,
+               REQUIRED_CONFIRMATION_ROUNDS,
                client_addr, client_key->sport,
                server_addr, server_key->sport,
                sni_value,
@@ -1336,6 +1419,13 @@ static const char *replay_status_name(ReplayStatus status) {
     }
 }
 
+static int replay_status_is_connection_error(ReplayStatus status) {
+    return status == REPLAY_STATUS_SOCKET_FAILED ||
+           status == REPLAY_STATUS_NONBLOCK_FAILED ||
+           status == REPLAY_STATUS_BIND_FAILED ||
+           status == REPLAY_STATUS_CONNECT_FAILED;
+}
+
 static void add_replay_ignore_from_socket(App *app, const FlowKey *server_key, int fd) {
     struct sockaddr_storage local;
     socklen_t local_len = sizeof(local);
@@ -1504,15 +1594,22 @@ static int replay_client_hello_to_server_once(App *app, const FlowKey *server_ke
                                               size_t client_hello_len, int attempt,
                                               size_t probe_index,
                                               const ProbeSpec *probe,
-                                              AppDataCloseProbe *appdata_close) {
+                                              AppDataCloseProbe *appdata_close,
+                                              ReplayStatus *status_out) {
     ReplayStatus status = REPLAY_STATUS_NO_RESPONSE;
     memset(appdata_close, 0, sizeof(*appdata_close));
+    if (status_out) {
+        *status_out = status;
+    }
 
     char server_addr[INET6_ADDRSTRLEN];
     flow_addr_to_string(server_key, 1, server_addr, sizeof(server_addr));
     int fd = connect_replay_socket(app, server_key, "TLS replay", NULL,
                                    attempt, &status);
     if (fd == -1) {
+        if (status_out) {
+            *status_out = status;
+        }
         return 0;
     }
 
@@ -1523,6 +1620,9 @@ static int replay_client_hello_to_server_once(App *app, const FlowKey *server_ke
                   attempt, server_addr, server_key->sport,
                   replay_status_name(status), strerror(errno));
         close(fd);
+        if (status_out) {
+            *status_out = status;
+        }
         return 0;
     }
 
@@ -1665,6 +1765,9 @@ static int replay_client_hello_to_server_once(App *app, const FlowKey *server_ke
                   probe_status_name(appdata_close->status),
                   response_len);
     }
+    if (status_out) {
+        *status_out = status;
+    }
     return got_response;
 }
 
@@ -1673,20 +1776,100 @@ static void run_replay_probe_attempt(ReplayTask *task, const uint8_t *client_hel
                                      size_t probe_index,
                                      ReplayProbeResult *result) {
     memset(result, 0, sizeof(*result));
+    result->final_status = REPLAY_STATUS_NO_RESPONSE;
     result->got_response = replay_client_hello_to_server_once(
         task->app, &task->server_key,
         client_hello, client_hello_len, attempt,
         probe_index, &task->app->probes[probe_index],
-        &result->appdata_close);
+        &result->appdata_close, &result->final_status);
+    result->connection_failed =
+        replay_status_is_connection_error(result->final_status);
 }
 
-static void run_replay_probe_round(ReplayTask *task, const uint8_t *client_hello,
-                                   size_t client_hello_len, int attempt,
-                                   ReplayProbeResult *results) {
-    for (size_t i = 0; i < task->app->probe_count; i++) {
-        run_replay_probe_attempt(task, client_hello, client_hello_len,
-                                 attempt, i, &results[i]);
+static void *replay_probe_attempt_worker(void *arg) {
+    ReplayProbeAttemptTask *probe_task = (ReplayProbeAttemptTask *)arg;
+    run_replay_probe_attempt(probe_task->task,
+                             probe_task->client_hello,
+                             probe_task->client_hello_len,
+                             probe_task->attempt,
+                             probe_task->probe_index,
+                             probe_task->result);
+    return NULL;
+}
+
+static ReplayRoundStatus run_replay_probe_round(ReplayTask *task,
+                                                const uint8_t *client_hello,
+                                                size_t client_hello_len,
+                                                int attempt,
+                                                ReplayProbeResult *results) {
+    size_t probe_count = task->app->probe_count;
+    if (probe_count == 0) {
+        return PROBE_ROUND_VALID;
     }
+
+    pthread_t *threads = calloc(probe_count, sizeof(*threads));
+    ReplayProbeAttemptTask *probe_tasks = calloc(probe_count,
+                                                 sizeof(*probe_tasks));
+    int *created = calloc(probe_count, sizeof(*created));
+    int round_valid = 1;
+    int internal_error = 0;
+
+    if (!threads || !probe_tasks || !created) {
+        log_infof("TLS replay attempt=%d discarded; failed to allocate concurrent probe tasks\n",
+                  attempt);
+        free(threads);
+        free(probe_tasks);
+        free(created);
+        return PROBE_ROUND_INTERNAL_ERROR;
+    }
+
+    for (size_t i = 0; i < probe_count; i++) {
+        probe_tasks[i].task = task;
+        probe_tasks[i].client_hello = client_hello;
+        probe_tasks[i].client_hello_len = client_hello_len;
+        probe_tasks[i].attempt = attempt;
+        probe_tasks[i].probe_index = i;
+        probe_tasks[i].result = &results[i];
+
+        int rc = pthread_create(&threads[i], NULL,
+                                replay_probe_attempt_worker,
+                                &probe_tasks[i]);
+        if (rc != 0) {
+            log_infof("TLS replay attempt=%d discarded; failed to create probe thread probe=%zu error=%s\n",
+                      attempt, i + 1, strerror(rc));
+            round_valid = 0;
+            internal_error = 1;
+            break;
+        }
+        created[i] = 1;
+    }
+
+    for (size_t i = 0; i < probe_count; i++) {
+        if (created[i]) {
+            pthread_join(threads[i], NULL);
+        }
+    }
+
+    if (round_valid) {
+        for (size_t i = 0; i < probe_count; i++) {
+            if (results[i].connection_failed) {
+                log_infof("TLS replay attempt=%d discarded; connection failed probe=%zu status=%s\n",
+                          attempt, i + 1,
+                          replay_status_name(results[i].final_status));
+                round_valid = 0;
+                break;
+            }
+        }
+    }
+
+    free(threads);
+    free(probe_tasks);
+    free(created);
+    if (internal_error) {
+        return PROBE_ROUND_INTERNAL_ERROR;
+    }
+    return round_valid ? PROBE_ROUND_VALID :
+                         PROBE_ROUND_CONNECTION_ERROR;
 }
 
 static void *replay_probe_worker(void *arg) {
@@ -1694,7 +1877,11 @@ static void *replay_probe_worker(void *arg) {
     size_t probe_count = task->app->probe_count;
     ReplayProbeResult *a = calloc(probe_count, sizeof(*a));
     ReplayProbeResult *c = calloc(probe_count, sizeof(*c));
+    unsigned int matched_rounds = 0;
+    int final_match = 0;
     if (!a || !c) {
+        finish_server_probe_round(task->app, &task->server_key, 0, 1,
+                                  &matched_rounds, &final_match);
         free(a);
         free(c);
         free(task->client_hello);
@@ -1702,11 +1889,15 @@ static void *replay_probe_worker(void *arg) {
         return NULL;
     }
 
-    run_replay_probe_round(task, task->client_hello, task->client_hello_len, 1, a);
+    ReplayRoundStatus a_status = run_replay_probe_round(task,
+                                                        task->client_hello,
+                                                        task->client_hello_len,
+                                                        1, a);
+    ReplayRoundStatus b_status = PROBE_ROUND_INTERNAL_ERROR;
 
     uint8_t *c_client_hello = malloc(task->client_hello_len);
     if (!c_client_hello) {
-        log_infof("TLS replay C skipped; failed to allocate ClientHello copy\n");
+        log_infof("TLS replay B skipped; failed to allocate ClientHello copy\n");
     } else {
         memcpy(c_client_hello, task->client_hello, task->client_hello_len);
         uint8_t session_id_len = 0;
@@ -1717,22 +1908,53 @@ static void *replay_probe_worker(void *arg) {
                                                      &session_id_len,
                                                      &session_id_before_hash,
                                                      &session_id_after_hash)) {
-            log_infof("TLS replay C randomized ClientHello legacy_session_id len=%u before=%08x after=%08x\n",
+            log_infof("TLS replay B randomized ClientHello legacy_session_id len=%u before=%08x after=%08x\n",
                       session_id_len, session_id_before_hash,
                       session_id_after_hash);
         } else {
-            log_infof("TLS replay C skipped ClientHello legacy_session_id randomization; original length is zero or ClientHello parse failed\n");
+            log_infof("TLS replay B skipped ClientHello legacy_session_id randomization; original length is zero or ClientHello parse failed\n");
         }
 
-        log_infof("TLS replay waiting %us before attempt=C randomized session_id recheck\n",
+        log_infof("TLS replay waiting %us before attempt=B randomized session_id recheck\n",
                   task->c_delay_seconds);
         sleep(task->c_delay_seconds);
-        run_replay_probe_round(task, c_client_hello, task->client_hello_len, 2, c);
-        free(c_client_hello);
+        b_status = run_replay_probe_round(task, c_client_hello,
+                                          task->client_hello_len, 2, c);
     }
+    free(c_client_hello);
 
-    print_replay_comparison(&task->client_key, &task->server_key, task->sni, a, c,
-                            probe_count);
+    if (a_status != PROBE_ROUND_VALID ||
+        b_status != PROBE_ROUND_VALID) {
+        finish_server_probe_round(task->app, &task->server_key, 0, 1,
+                                  &matched_rounds, &final_match);
+        log_infof("TLS replay confirmation round=%u skipped; discarded round A=%s B=%s\n",
+                  task->round_no,
+                  a_status == PROBE_ROUND_VALID ? "valid" : "discarded",
+                  b_status == PROBE_ROUND_VALID ? "valid" : "discarded");
+    } else {
+        int round_matches = replay_probe_matches_alarm_condition(a, c,
+                                                                 probe_count);
+        finish_server_probe_round(task->app, &task->server_key,
+                                  round_matches, 0,
+                                  &matched_rounds, &final_match);
+        if (final_match) {
+            print_replay_comparison(&task->client_key, &task->server_key,
+                                    task->sni, a, c, probe_count);
+        } else if (round_matches) {
+            char server_addr[INET6_ADDRSTRLEN];
+            flow_addr_to_string(&task->server_key, 1, server_addr,
+                                sizeof(server_addr));
+            log_infof("TLS replay confirmation round=%u/%u passed server=%s:%u\n",
+                      matched_rounds, REQUIRED_CONFIRMATION_ROUNDS,
+                      server_addr, task->server_key.sport);
+        } else {
+            char server_addr[INET6_ADDRSTRLEN];
+            flow_addr_to_string(&task->server_key, 1, server_addr,
+                                sizeof(server_addr));
+            log_infof("TLS replay confirmation failed; excluding server=%s:%u round=%u\n",
+                      server_addr, task->server_key.sport, task->round_no);
+        }
+    }
     free(a);
     free(c);
     free(task->client_hello);
@@ -1753,17 +1975,26 @@ static void replay_client_hello_to_server(App *app, TcpStream *server_stream) {
         return;
     }
 
-    if (!mark_server_probed_if_new(app, &server_stream->key)) {
+    unsigned int round_no = 0;
+    if (!start_server_probe_round(app, &server_stream->key, &round_no)) {
         return;
     }
 
     ReplayTask *task = calloc(1, sizeof(*task));
     if (!task) {
+        unsigned int matched_rounds = 0;
+        int final_match = 0;
+        finish_server_probe_round(app, &server_stream->key, 0, 1,
+                                  &matched_rounds, &final_match);
         return;
     }
 
     task->client_hello = malloc(client_hello.record_len);
     if (!task->client_hello) {
+        unsigned int matched_rounds = 0;
+        int final_match = 0;
+        finish_server_probe_round(app, &server_stream->key, 0, 1,
+                                  &matched_rounds, &final_match);
         free(task);
         return;
     }
@@ -1773,12 +2004,17 @@ static void replay_client_hello_to_server(App *app, TcpStream *server_stream) {
     task->server_key = server_stream->key;
     task->c_delay_seconds = app->c_delay_seconds;
     task->client_hello_len = client_hello.record_len;
+    task->round_no = round_no;
     snprintf(task->sni, sizeof(task->sni), "%s", client_stream->sni);
     memcpy(task->client_hello, client_hello.record, client_hello.record_len);
 
     pthread_t thread;
     int rc = pthread_create(&thread, NULL, replay_probe_worker, task);
     if (rc != 0) {
+        unsigned int matched_rounds = 0;
+        int final_match = 0;
+        finish_server_probe_round(app, &server_stream->key, 0, 1,
+                                  &matched_rounds, &final_match);
         free(task->client_hello);
         free(task);
         return;
